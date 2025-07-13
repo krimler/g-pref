@@ -1,0 +1,167 @@
+# G-Pref Dataset Generator, Validator, Real Prompt Integration, GKPO Serializer, and Metric Simulation
+
+import json
+import uuid
+import random
+import numpy as np
+from enum import Enum
+from typing import List, Dict
+
+# ------------------------------
+# RLHF Method Enum with Metadata
+# ------------------------------
+class RLHFMethod(str, Enum):
+    PPO = "ppo"         # Proximal Policy Optimization
+    DPO = "dpo"         # Direct Preference Optimization
+    DP_SFT = "dp-sft"   # Differentially Private SFT
+    CONST = "const"     # Constitutional AI
+    GKPO = "gkpo"       # Gaikwad Preference Object
+
+# ------------------------------
+# G-Pref Schema Validator
+# ------------------------------
+def validate_gpref(obj: Dict) -> bool:
+    required = ["g_pref_id", "prompt", "responses", "preferred", "rejected", 
+                "method", "identity", "epsilon", "transformed_from"]
+    for key in required:
+        if key not in obj:
+            return False
+    if obj["preferred"] == obj["rejected"]:
+        return False
+    return True
+
+# ------------------------------
+# Laplace Noise Utility
+# ------------------------------
+def add_laplace_noise(value: float, epsilon: float) -> float:
+    if epsilon == float("inf"):
+        return value
+    return value + np.random.laplace(0.0, 1.0 / epsilon)
+
+# ------------------------------
+# GKPO Serializer
+# ------------------------------
+def to_gkpo(obj: Dict) -> Dict:
+    return {
+        "id": obj["g_pref_id"],
+        "prompt": obj["prompt"],
+        "responses": obj["responses"],
+        "winner": obj["preferred"],
+        "loser": obj["rejected"],
+        "method": obj["method"],
+        "identity": obj["identity"],
+        "epsilon": obj["epsilon"],
+        "from": obj["transformed_from"],
+        "meta": obj.get("meta", {})
+    }
+
+# ------------------------------
+# Real Prompt Loading (e.g., HH-RLHF)
+# ------------------------------
+def load_real_prompts(path: str) -> List[str]:
+    with open(path) as f:
+        data = json.load(f)
+    prompts = [item["prompt"] for item in data if "prompt" in item]
+    return prompts
+
+# ------------------------------
+# Reward Simulation & Pairing
+# ------------------------------
+def simulate_reward(prompt: str, response: str) -> float:
+    return len(response) / (len(prompt) + 1)
+
+# ------------------------------
+# G-Pref Builder
+# ------------------------------
+def build_gpref(prompt_id: str, prompt: str, responses: List[str], 
+                method: str, identity: str, epsilon: float, transformed_from: str) -> Dict:
+
+    scores = [add_laplace_noise(simulate_reward(prompt, r), epsilon) for r in responses]
+    paired = list(zip(responses, scores))
+    sorted_resps = sorted(paired, key=lambda x: x[1], reverse=True)
+    return {
+        "g_pref_id": str(uuid.uuid4()),
+        "prompt_id": prompt_id,
+        "prompt": prompt,
+        "responses": responses,
+        "preferred": sorted_resps[0][0],
+        "rejected": sorted_resps[-1][0],
+        "method": method,
+        "identity": identity,
+        "epsilon": epsilon,
+        "transformed_from": transformed_from,
+        "meta": {
+            "scores": scores,
+            "generator": "v2"
+        }
+    }
+
+# ------------------------------
+# Dataset Generator + Metrics
+# ------------------------------
+def generate_gpref_dataset(prompts: List[str], epsilons = [0.1, 0.5, float("inf")]):
+    dataset = []
+    identities = ["clinician", "nurse", "student"]
+    methods = [RLHFMethod.PPO, RLHFMethod.DPO, RLHFMethod.DP_SFT]
+
+    for i, prompt in enumerate(prompts):
+        prompt_id = f"gpref-{i:04}"
+        responses = [
+            "Use ACE inhibitors.",
+            "Recommend lifestyle changes first.",
+            "Avoid salt and monitor BP weekly."
+        ]
+        base_method = random.choice(methods)
+        identity = random.choice(identities)
+
+        for eps in epsilons:
+            gpref = build_gpref(prompt_id, prompt, responses, base_method, identity, eps, "original")
+            if validate_gpref(gpref):
+                dataset.append(gpref)
+                transformed = gpref.copy()
+                transformed["method"] = RLHFMethod.DPO
+                transformed["transformed_from"] = base_method
+                transformed["g_pref_id"] = str(uuid.uuid4())
+                dataset.append(transformed)
+
+    return dataset
+
+# ------------------------------
+# Flip Rate / KL Loss Estimation
+# ------------------------------
+def estimate_metrics(dataset: List[Dict]):
+    flip_count = 0
+    kl_total = 0
+    total = 0
+    for obj in dataset:
+        scores = obj["meta"]["scores"]
+        probs = np.exp(scores) / np.sum(np.exp(scores))
+        ref = np.array([1.0 if r == obj["preferred"] else 0.0 for r in obj["responses"]])
+        ref = ref / np.sum(ref)
+        kl = np.sum(ref * np.log((ref + 1e-8) / (probs + 1e-8)))
+        kl_total += kl
+        if ref.argmax() != probs.argmax():
+            flip_count += 1
+        total += 1
+    return {
+        "flip_rate": flip_count / total,
+        "avg_kl": kl_total / total
+    }
+
+# ------------------------------
+# Main Entry
+# ------------------------------
+if __name__ == "__main__":
+    # Replace with real prompt file path
+    real_prompts = [f"What is treatment recommendation for case #{i}?" for i in range(10)]
+    dataset = generate_gpref_dataset(real_prompts)
+    print("Generated:", len(dataset), "G-Pref items")
+    metrics = estimate_metrics(dataset)
+    print("Flip Rate:", metrics["flip_rate"])
+    print("Avg KL Divergence:", metrics["avg_kl"])
+
+    # Save GKPO-style
+    with open("g_pref_dataset_gkpo.jsonl", "w") as f:
+        for obj in dataset:
+            f.write(json.dumps(to_gkpo(obj)) + "\n")
+    print("Saved as GKPO format.")
